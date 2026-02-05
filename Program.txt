@@ -1,0 +1,401 @@
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL; -- Important pour to_unsigned, signed/unsigned conversions
+use IEEE.MATH_REAL.ALL;  -- Pour log2 et ceil si vous calculez ADDR_WIDTH dynamiquement
+
+-- *****************************************************************************
+-- ENTITY: vga_camera_controller
+-- Description: Main entity for VGA display with OV5640 camera input
+-- *****************************************************************************
+entity vga_camera_controller is
+    port (
+        -- Entrées de la carte Nexys A7
+        CLK100MHZ  : in std_logic;      -- L'horloge principale de 100 MHz de la Nexys A7
+        CPU_RESETN : in std_logic;      -- Bouton de réinitialisation (actif bas)
+
+        -- Sorties VGA (vers le moniteur)
+        VGA_HS     : out std_logic;
+        VGA_VS     : out std_logic;
+        VGA_R      : out std_logic_vector(3 downto 0);
+        VGA_G      : out std_logic_vector(3 downto 0);
+        VGA_B      : out std_logic_vector(3 downto 0);
+
+        -- Entrées de la Caméra OV5640 (DVP Mode) - Exemple typique
+        -- Adaptez les noms de ports selon votre XDC et branchement
+        CAM_PCLK   : in std_logic;      -- Pixel Clock de la caméra
+        CAM_HSYNC  : in std_logic;      -- Horizontal Sync de la caméra
+        CAM_VSYNC  : in std_logic;      -- Vertical Sync de la caméra
+        CAM_D      : in std_logic_vector(9 downto 0); -- Bus de données de la caméra (si 10-bit DVP)
+                                                       -- Si 8-bit DVP: (7 downto 0)
+
+        -- Interfaces DDR SDRAM (vers l'IP MIG)
+        -- Ces ports sont générés par l'IP MIG, ils sont complexes.
+        -- Je les laisse ici comme placeholder, Vivado les gérera principalement.
+        -- ui_clk         : out std_logic;  -- User Interface Clock du MIG
+        -- ui_rst_n       : out std_logic;  -- Reset du MIG
+        -- app_en         : out std_logic;
+        -- app_wreq       : out std_logic;
+        -- app_waddr      : out std_logic_vector(DDR_ADDR_WIDTH-1 downt0 0);
+        -- app_wdata      : out std_logic_vector(DDR_DATA_WIDTH-1 downto 0);
+        -- app_wready     : in  std_logic;
+        -- app_rreq       : out std_logic;
+        -- app_raddr      : out std_logic_vector(DDR_ADDR_WIDTH-1 downto 0);
+        -- app_rdata      : in  std_logic_vector(DDR_DATA_WIDTH-1 downto 0);
+        -- app_rvalid     : in  std_logic;
+        -- app_rready     : out std_logic;
+        -- init_calib_complete : in std_logic
+        -- ... et les ports physiques de la DDR à définir dans le XDC pour le MIG
+    );
+end vga_camera_controller;
+
+-- *****************************************************************************
+-- ARCHITECTURE: Behavioral
+-- *****************************************************************************
+architecture Behavioral of vga_camera_controller is
+
+    -- ** Signaux de l'Horloge Pixel VGA **
+    signal pixel_clk  : std_logic;
+    signal clk_locked : std_logic; -- Indique que la PLL est verrouillée
+
+    -- Déclaration du composant Clocking Wizard
+    -- Le nom de l'entité ici doit correspondre au "Component Name" de votre Clocking Wizard
+    component clk_wiz_0
+        port(
+            clk_in1  : in std_logic;
+            clk_out1 : out std_logic;
+            reset    : in std_logic; -- Le reset du clk_wiz est actif haut (NOT CPU_RESETN)
+            locked   : out std_logic
+        );
+    end component;
+
+    -- ** Constantes de Timing pour VGA 640x480 @ 60Hz **
+    -- Horizontal:
+    constant H_DISPLAY_VGA    : integer := 640; -- Pixels affichés
+    constant H_FRONT_PORCH_VGA: integer := 16;  -- Pixels avant le sync pulse
+    constant H_SYNC_VGA       : integer := 96;  -- Largeur du sync pulse
+    constant H_BACK_PORCH_VGA : integer := 48;  -- Pixels après le sync pulse
+    constant H_TOTAL_VGA      : integer := H_DISPLAY_VGA + H_FRONT_PORCH_VGA + H_SYNC_VGA + H_BACK_PORCH_VGA; -- Total pixels par ligne (800)
+
+    -- Vertical:
+    constant V_DISPLAY_VGA    : integer := 480; -- Lignes affichées
+    constant V_FRONT_PORCH_VGA: integer := 10;  -- Lignes avant le sync pulse
+    constant V_SYNC_VGA       : integer := 2;   -- Largeur du sync pulse
+    constant V_BACK_PORCH_VGA : integer := 33;  -- Lignes après le sync pulse
+    constant V_TOTAL_VGA      : integer := V_DISPLAY_VGA + V_FRONT_PORCH_VGA + V_SYNC_VGA + V_BACK_PORCH_VGA; -- Total lignes par trame (525)
+
+    -- ** Compteurs VGA **
+    signal h_counter_vga : integer range 0 to H_TOTAL_VGA - 1 := 0;
+    signal v_counter_vga : integer range 0 to V_TOTAL_VGA - 1 := 0;
+
+    -- ** Signaux de contrôle d'affichage VGA **
+    signal h_active_vga : boolean := false;
+    signal v_active_vga : boolean := false;
+
+    -- *************************************************************************
+    -- NOUVEAUX ÉLÉMENTS POUR LA CAMÉRA ET LA DDR SDRAM
+    -- *************************************************************************
+
+    -- ** Signaux d'interface Caméra **
+    -- Les timings de la caméra sont différents de ceux du VGA !
+    -- Ici, utilisez les timings réels de la caméra OV5640 pour la résolution souhaitée.
+    -- Par exemple, 640x480 de l'OV5640 peut avoir des H_TOTAL et V_TOTAL différents.
+    constant H_DISPLAY_CAM    : integer := 640;
+    constant V_DISPLAY_CAM    : integer := 480;
+    -- Les valeurs exactes de H_TOTAL_CAM et V_TOTAL_CAM dépendent de la configuration de la caméra.
+    -- Ces valeurs doivent être déterminées par l'analyse des signaux HSYNC/VSYNC de la caméra.
+    -- Pour l'instant, utilisons les mêmes valeurs de base pour la zone active.
+    -- Les periodes de blanking de la caméra sont souvent gérées par le PCLK et les fronts de HSYNC/VSYNC.
+    -- Nous aurons besoin de compter les pixels/lignes de la caméra.
+    signal h_counter_cam : integer range 0 to H_DISPLAY_CAM + 200 := 0; -- Exemple: prévoir un peu plus que le display
+    signal v_counter_cam : integer range 0 to V_DISPLAY_CAM + 100 := 0; -- Exemple: prévoir un peu plus que le display
+
+    signal cam_pixel_data_rgb565 : std_logic_vector(15 downto 0); -- Données brutes de la caméra
+    signal cam_pixel_valid       : std_logic; -- Indique si le pixel est valide (pas de blanking)
+
+    -- ** Signaux de Conversion Pixel **
+    signal converted_pixel_rgb444 : std_logic_vector(11 downto 0);
+
+    -- ** Signaux d'interface DDR SDRAM (Frame Buffer) **
+    -- Le MIG IP (Memory Interface Generator) gérera les signaux bas niveau de la DDR.
+    -- Nous aurons des interfaces utilisateur pour lire et écrire dans la DDR.
+
+    -- Adresses et données pour l'écriture dans la DDR (venant de la caméra)
+    constant FB_ADDR_WIDTH : integer := integer(ceil(log2(real(H_DISPLAY_CAM * V_DISPLAY_CAM * 2)))); -- Double buffer
+    constant FB_DATA_WIDTH : integer := 12; -- Largeur des données du pixel (4R4G4B)
+
+    signal fb_write_addr  : unsigned(FB_ADDR_WIDTH-1 downto 0);
+    signal fb_write_data  : std_logic_vector(FB_DATA_WIDTH-1 downto 0);
+    signal fb_write_en    : std_logic;
+    signal fb_write_ready : std_logic; -- Du MIG, indique qu'on peut écrire
+
+    -- Adresses et données pour la lecture depuis la DDR (pour le VGA)
+    signal fb_read_addr   : unsigned(FB_ADDR_WIDTH-1 downto 0);
+    signal fb_read_data   : std_logic_vector(FB_DATA_WIDTH-1 downto 0);
+    signal fb_read_req    : std_logic;
+    signal fb_read_valid  : std_logic; -- Du MIG, indique que les données sont valides
+
+    -- Contrôle du double buffering
+    signal current_write_buffer : std_logic := '0'; -- 0 ou 1 pour le buffer actif d'écriture
+    signal current_read_buffer  : std_logic := '1'; -- 0 ou 1 pour le buffer actif de lecture
+    signal new_frame_ready_to_read : std_logic := '0'; -- Signal pour basculer les buffers
+
+    -- Clock pour l'interface utilisateur du MIG (souvent différente de pixel_clk)
+    -- Le MIG génère sa propre UI_CLK et UI_RST.
+    signal ui_clk      : std_logic;
+    signal ui_rst_sync : std_logic; -- Reset synchronisé pour le domaine ui_clk
+
+begin
+
+    -- ** Instanciation du Clocking Wizard (VGA Pixel Clock) **
+    U_Clocking_Wizard : clk_wiz_0
+        port map (
+            clk_in1  => CLK100MHZ,
+            clk_out1 => pixel_clk,
+            reset    => not CPU_RESETN, -- Le reset du clk_wiz est souvent actif haut
+            locked   => clk_locked
+        );
+
+    -- ** Logique des Compteurs Horizontaux et Verticaux pour VGA **
+    process(pixel_clk, CPU_RESETN)
+    begin
+        if CPU_RESETN = '0' then
+            h_counter_vga <= 0;
+            v_counter_vga <= 0;
+        elsif rising_edge(pixel_clk) then
+            if h_counter_vga < H_TOTAL_VGA - 1 then
+                h_counter_vga <= h_counter_vga + 1;
+            else
+                h_counter_vga <= 0;
+                if v_counter_vga < V_TOTAL_VGA - 1 then
+                    v_counter_vga <= v_counter_vga + 1;
+                else
+                    v_counter_vga <= 0;
+                end if;
+            end if;
+        end if;
+    end process;
+
+    -- ** Génération des Signaux HS et VS pour VGA **
+    VGA_HS <= '0' when (h_counter_vga >= H_DISPLAY_VGA + H_FRONT_PORCH_VGA) and (h_counter_vga < H_DISPLAY_VGA + H_FRONT_PORCH_VGA + H_SYNC_VGA) else '1';
+    VGA_VS <= '0' when (v_counter_vga >= V_DISPLAY_VGA + V_FRONT_PORCH_VGA) and (v_counter_vga < V_DISPLAY_VGA + V_FRONT_PORCH_VGA + V_SYNC_VGA) else '1';
+
+    -- ** Détermination des Zones Actives d'Affichage VGA **
+    h_active_vga <= true when h_counter_vga < H_DISPLAY_VGA else false;
+    v_active_vga <= true when v_counter_vga < V_DISPLAY_VGA else false;
+
+    -- *************************************************************************
+    -- NOUVEAUX MODULES ET LOGIQUE (À DÉVELOPPER/INTÉGRER)
+    -- *************************************************************************
+
+    -- ** 1. Interface Caméra OV5640 (DVP) **
+    -- Ce module lira les signaux CAM_PCLK, CAM_HSYNC, CAM_VSYNC, CAM_D
+    -- Il doit gérer la configuration de la caméra via SCCB (I2C) si nécessaire pour le format RGB565.
+    -- Il produira cam_pixel_data_rgb565 et cam_pixel_valid.
+    -- Vous devrez soit le développer vous-même (complexe), soit trouver un IP open-source.
+
+    -- Exemple d'instanciation (le composant n'est pas déclaré ici, il serait dans un autre fichier VHDL)
+    -- U_OV5640_Interface : ov5640_dvp_interface
+    --     port map (
+    --         pclk      => CAM_PCLK,
+    --         hsync     => CAM_HSYNC,
+    --         vsync     => CAM_VSYNC,
+    --         data_in   => CAM_D,
+    --         -- SCCB (I2C) signals for camera configuration
+    --         -- sccb_scl  => ...,
+    --         -- sccb_sda  => ...,
+    --         -- pixel_clk_i => CAM_PCLK, -- or a faster clock for internal logic
+    --         reset_n_i => CPU_RESETN,
+    --         rgb565_data_o => cam_pixel_data_rgb565,
+    --         pixel_valid_o => cam_pixel_valid,
+    --         h_counter_o   => h_counter_cam, -- Pour le debug et l'adressage
+    --         v_counter_o   => v_counter_cam  -- Pour le debug et l'adressage
+    --     );
+
+
+    -- ** 2. Convertisseur de Format de Pixel (RGB565 vers RGB444) **
+    -- Prend le pixel 16-bit RGB565 de la caméra et le convertit en 12-bit RGB444
+    process(cam_pixel_data_rgb565)
+    begin
+        -- Rouge (5 bits -> 4 bits)
+        converted_pixel_rgb444(11 downto 8) <= cam_pixel_data_rgb565(15 downto 12);
+        -- Vert (6 bits -> 4 bits)
+        converted_pixel_rgb444(7 downto 4)  <= cam_pixel_data_rgb565(10 downto 7);
+        -- Bleu (5 bits -> 4 bits)
+        converted_pixel_rgb444(3 downto 0)  <= cam_pixel_data_rgb565(4 downto 1);
+        -- Note: Ceci est une troncature. Pour un arrondi plus précis, vous pouvez ajouter une logique d'arrondi.
+    end process;
+
+
+    -- ** 3. Contrôleur de Frame Buffer (DDR SDRAM via MIG) **
+    -- Ceci est le module le plus complexe. Il faut:
+    -- A. Instancier le MIG (généré par Vivado dans IP Catalog). Le MIG aura de nombreux ports.
+    -- B. Développer un arbitre/contrôleur pour gérer les accès en écriture (caméra) et lecture (VGA) à la DDR.
+    -- C. Implémenter la logique de double buffering pour commuter les buffers.
+
+    -- --- Instanciation du MIG (Exemple, les vrais ports sont nombreux et spécifiques) ---
+    -- U_MIG : mig_7series_0 -- Nom de l'IP MIG généré par Vivado
+    -- port map (
+    --     -- Clocks et Resets du MIG
+    --     sys_clk_i           => CLK100MHZ,
+    --     sys_rst             => not CPU_RESETN,
+    --     -- Interface Utilisateur (UI)
+    --     ui_clk              => ui_clk,
+    --     ui_clk_sync_rst     => ui_rst_sync,
+    --     init_calib_complete => init_calib_complete,
+    --     -- Ports d'application AXI (simplifié pour l'exemple) ou de type "native"
+    --     app_en              => '1', -- Toujours activé
+    --     app_wreq            => fb_write_en,
+    --     app_waddr           => std_logic_vector(fb_write_addr),
+    --     app_wdata           => fb_write_data,
+    --     app_wready          => fb_write_ready,
+    --     app_rreq            => fb_read_req,
+    --     app_raddr           => std_logic_vector(fb_read_addr),
+    --     app_rdata           => fb_read_data,
+    --     app_rvalid          => fb_read_valid,
+    --     app_rready          => '1', -- Toujours prêt à recevoir les données lues
+    --     -- ... de nombreux autres ports de la DDR physique ...
+    -- );
+
+    -- --- Logique de synchronisation du reset pour le domaine UI_CLK du MIG ---
+    -- (Vous aurez besoin d'un synchronizer si ui_clk est dans un domaine différent de pixel_clk ou CLK100MHZ)
+    -- process (ui_clk, CPU_RESETN)
+    --    variable rst_q : std_logic_vector(1 downto 0);
+    -- begin
+    --    if CPU_RESETN = '0' then
+    --       rst_q := (others => '0');
+    --    elsif rising_edge(ui_clk) then
+    --       rst_q(0) := '1'; -- Ou '0' si reset actif bas
+    --       rst_q(1) := rst_q(0);
+    --    end if;
+    --    ui_rst_sync <= rst_q(1);
+    -- end process;
+
+
+    -- --- Logique d'écriture dans le Frame Buffer (domaine CAM_PCLK ou pixel_clk si synchronisé) ---
+    process(CAM_PCLK, CPU_RESETN) -- Ou pixel_clk si vous synchronisez les données caméra sur pixel_clk
+    begin
+        if CPU_RESETN = '0' then
+            fb_write_en   <= '0';
+            fb_write_addr <= (others => '0');
+            fb_write_data <= (others => '0');
+        elsif rising_edge(CAM_PCLK) then -- Les données de la caméra arrivent sur CAM_PCLK
+            -- Logique pour incrémenter fb_write_addr basée sur h_counter_cam et v_counter_cam
+            -- Détecter si un pixel de la caméra est dans la zone active d'affichage (à déterminer avec CAM_HSYNC, CAM_VSYNC)
+            -- et si le pixel_valid de la caméra est haut.
+
+            -- Exemple simplifié: Si cam_pixel_valid='1' et la zone est active
+            -- Vous devez définir h_active_cam et v_active_cam basés sur CAM_HSYNC/VSYNC/Compteurs caméra
+            if CAM_HSYNC = '1' and CAM_VSYNC = '1' then -- simplification grossière, adaptez
+                fb_write_en   <= '1';
+                fb_write_data <= converted_pixel_rgb444;
+                -- Calcul de l'adresse d'écriture
+                -- L'adresse doit inclure le décalage pour le double buffer
+                fb_write_addr <= to_unsigned(
+                                    to_integer(current_write_buffer) * H_DISPLAY_CAM * V_DISPLAY_CAM +
+                                    (to_integer(v_counter_cam) * H_DISPLAY_CAM) +
+                                    to_integer(h_counter_cam),
+                                    FB_ADDR_WIDTH
+                                );
+            else
+                fb_write_en <= '0';
+            end if;
+        end if;
+    end process;
+
+
+    -- --- Logique de Lecture depuis le Frame Buffer (domaine pixel_clk) ---
+    -- Le VGA demande les pixels sur son propre pixel_clk
+    process(pixel_clk, CPU_RESETN)
+    begin
+        if CPU_RESETN = '0' then
+            fb_read_req   <= '0';
+            fb_read_addr  <= (others => '0');
+        elsif rising_edge(pixel_clk) then
+            -- Demander une lecture si on est dans la zone d'affichage active du VGA
+            if h_active_vga and v_active_vga then
+                fb_read_req <= '1';
+                -- Calcul de l'adresse de lecture
+                -- L'adresse doit inclure le décalage pour le buffer de lecture
+                fb_read_addr <= to_unsigned(
+                                    to_integer(current_read_buffer) * H_DISPLAY_VGA * V_DISPLAY_VGA +
+                                    (to_integer(v_counter_vga) * H_DISPLAY_VGA) +
+                                    to_integer(h_counter_vga),
+                                    FB_ADDR_WIDTH
+                                );
+            else
+                fb_read_req <= '0';
+            end if;
+        end if;
+    end process;
+
+
+    -- --- Logique de Double Buffering ---
+    -- Bascule les buffers lorsque la caméra a terminé d'écrire une trame et la DDR est prête.
+    process(CAM_PCLK, CPU_RESETN) -- Ou pixel_clk si synchronisation complexe
+    begin
+        if CPU_RESETN = '0' then
+            current_write_buffer <= '0';
+            current_read_buffer  <= '1';
+            new_frame_ready_to_read <= '0';
+        elsif rising_edge(CAM_PCLK) then -- Ou à la fin d'une trame de caméra
+            -- Détection de la fin d'une trame de la caméra (quand CAM_VSYNC passe de '0' à '1' ou vice-versa, ou après V_TOTAL_CAM)
+            -- C'est une simplification, le vrai basculement doit être synchronisé et robuste.
+            -- Ici, on va simplifier par la fin de la V_TOTAL_CAM
+            if (v_counter_cam = V_TOTAL_CAM - 1) and (h_counter_cam = H_TOTAL_CAM - 1) then -- End of camera frame
+                if new_frame_ready_to_read = '0' then -- Évite de basculer si la lecture n'est pas finie
+                    current_write_buffer <= not current_write_buffer; -- Prépare l'écriture dans l'autre buffer
+                    new_frame_ready_to_read <= '1'; -- Indique que le nouveau frame est prêt
+                end if;
+            end if;
+        end if;
+    end process;
+
+    process(pixel_clk, CPU_RESETN)
+    begin
+        if CPU_RESETN = '0' then
+            current_read_buffer <= '1';
+            new_frame_ready_to_read <= '0';
+        elsif rising_edge(pixel_clk) then
+            -- Si un nouveau frame est prêt et que le VGA a atteint la fin de son affichage
+            if new_frame_ready_to_read = '1' and v_counter_vga = V_TOTAL_VGA - 1 and h_counter_vga = H_TOTAL_VGA - 1 then
+                current_read_buffer <= not current_read_buffer; -- Bascule le buffer de lecture
+                new_frame_ready_to_read <= '0'; -- Réinitialise pour la prochaine frame
+            end if;
+        end if;
+    end process;
+
+
+    -- ** 4. Logique de la Couleur pour VGA **
+    -- Maintenant, la couleur vient du Frame Buffer (fb_read_data)
+    process(pixel_clk, CPU_RESETN)
+    begin
+        if CPU_RESETN = '0' then
+            VGA_R <= (others => '0');
+            VGA_G <= (others => '0');
+            VGA_B <= (others => '0');
+        elsif rising_edge(pixel_clk) then
+            -- S'assurer que le Clocking Wizard est verrouillé et la DDR est prête
+            -- init_calib_complete (du MIG) doit être '1'
+            -- if clk_locked = '1' and init_calib_complete = '1' then
+            if clk_locked = '1' then -- Pour le moment, sans MIG activé
+                if h_active_vga and v_active_vga then
+                    -- Utiliser les données lues de la DDR
+                    VGA_R <= fb_read_data(11 downto 8);
+                    VGA_G <= fb_read_data(7 downto 4);
+                    VGA_B <= fb_read_data(3 downto 0);
+                else
+                    -- Hors de la zone active (blanking), les couleurs sont à zéro
+                    VGA_R <= (others => '0');
+                    VGA_G <= (others => '0');
+                    VGA_B <= (others => '0');
+                end if;
+            else
+                -- Si la PLL n'est pas verrouillée ou DDR non prête, envoyer du noir
+                VGA_R <= (others => '0');
+                VGA_G <= (others => '0');
+                VGA_B <= (others => '0');
+            end if;
+        end if;
+    end process;
+
+end Behavioral;
