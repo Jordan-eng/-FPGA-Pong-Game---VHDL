@@ -21,7 +21,6 @@ Une implémentation matérielle classique du jeu **Pong** entièrement écrite e
 
 * **Carte FPGA :** (Ex: Digilent Basys 3, Nexys A7, ou toute carte avec un port VGA).
 <img width="328" height="276" alt="image" src="https://github.com/user-attachments/assets/db4eed8b-d13d-4819-8cf2-591272702c35" />
-<img width="328" height="276" alt="image" src="https://github.com/user-attachments/assets/db4eed8b-d13d-4819-8cf2-591272702c35" />
 
 * *Horloge :* 100 MHz.
 
@@ -31,14 +30,14 @@ Une implémentation matérielle classique du jeu **Pong** entièrement écrite e
 
 ## 📂 Structure du Projet
 
-* `Pong_Game.vhd` : Le module **Top Level**. Il contient :
+* `ecran.vhd` : Le module **Top Level**. Il contient :
 * La machine à états du jeu.
 * La logique de mouvement de la balle et des raquettes.
 * Le générateur de pixels (dessin des rectangles).
 
 
-* `VGA_Controller.vhd` : Module générant les signaux de synchronisation `HSYNC` et `VSYNC` ainsi que les coordonnées actuelles du pixel (`h_addr`, `v_addr`).
-* `Constraints.xdc` : Fichier de contraintes liant les ports VHDL aux broches physiques du FPGA.
+* `VProgram.txt : Module générant les signaux de synchronisation `HSYNC` et `VSYNC` ainsi que les coordonnées actuelles du pixel (`h_addr`, `v_addr`).
+* `Nexys-A7-100T-Master.xdc` : Fichier de contraintes liant les ports VHDL aux broches physiques du FPGA.
 
 ## ⚙️ Paramètres Techniques
 
@@ -54,10 +53,9 @@ Une implémentation matérielle classique du jeu **Pong** entièrement écrite e
 
 1. **Cloner le repo :**
 ```bash
-git clone https://github.com/votre-username/fpga-pong-vhdl.git
+git clone https://github.com/Jordan-eng/fpga-pong-vhdl.git
 
 ```
-
 
 2. **Ouvrir le projet :** Lancez Vivado (ou votre outil FPGA préféré) et créez un nouveau projet.
 3. **Importer les sources :** Ajoutez `Pong_Game.vhd` et `VGA_Controller.vhd`.
